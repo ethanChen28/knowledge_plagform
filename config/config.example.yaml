@@ -1,0 +1,69 @@
+server:
+  host: 0.0.0.0
+  port: 8080
+  data_root: /app/data
+  log_level: INFO
+
+models:
+  llm:
+    provider: openai_compatible
+    enabled: true
+    model: Qwen3.5-397B
+    base_url: http://192.168.11.18:30055/v1
+    api_key_env: OPENAI_API_KEY
+    timeout_seconds: 180
+    client_configs: {}
+    extra_body: {}
+  vision:
+    provider: openai_compatible
+    enabled: true
+    model: Qwen3.5-397B
+    base_url: http://192.168.11.18:30055/v1
+    api_key_env: OPENAI_API_KEY
+    timeout_seconds: 180
+    client_configs: {}
+    extra_body: {}
+    # Qwen is used for chat and multimodal requests.
+    # Embeddings are served by the dedicated BAAI/bge-m3 endpoint below.
+  embedding:
+    provider: openai_compatible
+    enabled: true
+    model: BAAI/bge-m3
+    base_url: http://192.168.16.36:8081/v1
+    api_key_env: EMBEDDING_API_KEY
+    api_key_optional: true
+    placeholder_api_key: EMPTY
+    dimension: 1024
+    max_token_size: 8192
+    timeout_seconds: 120
+    client_configs: {}
+
+rag_anything:
+  parser: mineru
+  parse_method: auto
+  parser_output_dir: output
+  display_content_stats: true
+  enable_image_processing: true
+  enable_table_processing: true
+  enable_equation_processing: true
+  max_concurrent_files: 1
+  context_window: 1
+  context_mode: page
+  max_context_tokens: 2000
+  include_headers: true
+  include_captions: true
+  context_filter_content_types:
+    - text
+  content_format: minerU
+  use_full_path: false
+
+light_rag:
+  init_kwargs:
+    vector_storage: QdrantVectorDBStorage
+    graph_storage: Neo4JStorage
+    cosine_better_than_threshold: 0.2
+  query_defaults:
+    mode: hybrid
+    top_k: 20
+    chunk_top_k: 10
+    vlm_enhanced: true

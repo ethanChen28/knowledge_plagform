@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>多模态知识库控制台</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script defer src="/assets/app.js"></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <div class="ambient ambient-a"></div>
+      <div class="ambient ambient-b"></div>
+      <aside class="sidebar panel" data-reveal>
+        <div class="brand-block">
+          <p class="eyebrow">Multimodal RAG Console</p>
+          <h1>多模态知识库控制台</h1>
+          <p class="muted">
+            统一管理知识库、文档入库和检索问答。当前前端直接调用你已经启动的 FastAPI 服务。
+          </p>
+        </div>
+        <div class="sidebar-actions">
+          <button id="refresh-kbs" class="button button-secondary" type="button">刷新列表</button>
+          <a class="button button-ghost" href="/docs" target="_blank" rel="noreferrer">接口文档</a>
+        </div>
+        <section class="sidebar-section">
+          <div class="section-heading">
+            <h2>知识库</h2>
+            <span id="kb-count" class="pill">0</span>
+          </div>
+          <div id="knowledge-base-list" class="stacked-list"></div>
+        </section>
+        <section class="sidebar-section">
+          <div class="section-heading">
+            <h2>新建知识库</h2>
+          </div>
+          <form id="create-kb-form" class="stacked-form">
+            <label>
+              <span>名称</span>
+              <input name="name" type="text" placeholder="例如：财报图库" required>
+            </label>
+            <label>
+              <span>描述</span>
+              <textarea name="description" rows="3" placeholder="说明这个知识库的用途"></textarea>
+            </label>
+            <label>
+              <span>配置覆盖</span>
+              <textarea name="config_overrides" rows="6" spellcheck="false" placeholder='{"light_rag_init_kwargs": {"addon_params": {}}}'></textarea>
+            </label>
+            <button class="button button-primary" type="submit">创建知识库</button>
+          </form>
+        </section>
+      </aside>
+
+      <main class="content">
+        <section class="hero panel" data-reveal>
+          <div class="hero-copy">
+            <p class="eyebrow">Runtime Overview</p>
+            <h2>面向文档、图片、表格和公式的一体化工作台</h2>
+            <p class="muted">
+              当前服务已经接入 Qwen 聊天/视觉模型、BAAI 向量化服务、Qdrant 向量库和 Neo4j 图数据库。
+            </p>
+          </div>
+          <div class="hero-links">
+            <a class="button button-secondary" href="/" aria-current="page">控制台</a>
+            <a class="button button-ghost" href="/redoc" target="_blank" rel="noreferrer">ReDoc</a>
+          </div>
+        </section>
+
+        <section class="summary-grid">
+          <article class="panel stat-card" data-reveal>
+            <span class="stat-label">服务状态</span>
+            <strong id="service-health">检查中</strong>
+            <p id="service-health-detail" class="muted">等待健康检查结果</p>
+          </article>
+          <article class="panel stat-card" data-reveal>
+            <span class="stat-label">向量 / 图谱</span>
+            <strong id="storage-summary">加载中</strong>
+            <p id="storage-detail" class="muted">等待系统配置</p>
+          </article>
+          <article class="panel stat-card" data-reveal>
+            <span class="stat-label">模型编排</span>
+            <strong id="model-summary">加载中</strong>
+            <p id="model-detail" class="muted">等待系统配置</p>
+          </article>
+        </section>
+
+        <section class="workspace-grid">
+          <article class="panel kb-panel" data-reveal>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Knowledge Base</p>
+                <h2 id="selected-kb-name">请选择一个知识库</h2>
+              </div>
+              <button id="delete-kb" class="button button-danger" type="button" disabled>删除知识库</button>
+            </div>
+            <p id="selected-kb-description" class="muted">
+              左侧创建或选择一个知识库后，这里会显示详情、文档列表和问答入口。
+            </p>
+            <div id="selected-kb-meta" class="meta-grid"></div>
+          </article>
+
+          <article class="panel upload-panel" data-reveal>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Ingestion</p>
+                <h2>上传文档</h2>
+              </div>
+              <span id="upload-status" class="pill neutral">待命</span>
+            </div>
+            <form id="upload-form" class="stacked-form">
+              <label class="file-drop">
+                <span>选择一个或多个文件</span>
+                <input id="upload-files" name="files" type="file" multiple>
+              </label>
+              <button class="button button-primary" type="submit" disabled>开始入库</button>
+            </form>
+          </article>
+
+          <article class="panel query-panel" data-reveal>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Retrieval</p>
+                <h2>知识检索问答</h2>
+              </div>
+              <span id="query-status" class="pill neutral">待命</span>
+            </div>
+            <form id="query-form" class="stacked-form">
+              <label>
+                <span>检索模式</span>
+                <select name="mode" id="query-mode">
+                  <option value="">默认</option>
+                  <option value="hybrid">hybrid</option>
+                  <option value="mix">mix</option>
+                  <option value="local">local</option>
+                  <option value="global">global</option>
+                  <option value="naive">naive</option>
+                </select>
+              </label>
+              <label>
+                <span>查询问题</span>
+                <textarea name="query" rows="4" placeholder="例如：总结这个知识库里关于图表解析的关键结论" required></textarea>
+              </label>
+              <label>
+                <span>系统提示词</span>
+                <textarea name="system_prompt" rows="3" placeholder="可选，用于约束回答风格"></textarea>
+              </label>
+              <button class="button button-primary" type="submit" disabled>发起检索</button>
+            </form>
+            <div class="answer-shell">
+              <div class="answer-heading">
+                <span>回答结果</span>
+              </div>
+              <pre id="query-answer">等待检索结果</pre>
+            </div>
+          </article>
+
+          <article class="panel documents-panel" data-reveal>
+            <div class="section-heading">
+              <div>
+                <p class="eyebrow">Documents</p>
+                <h2>文档处理状态</h2>
+              </div>
+              <span id="document-count" class="pill">0</span>
+            </div>
+            <div id="document-list" class="stacked-list"></div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  </body>
+</html>

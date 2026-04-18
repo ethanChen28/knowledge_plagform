@@ -1,0 +1,6 @@
+[submodule "RAG-Anything"]
+	path = RAG-Anything
+	url = https://github.com/HKUDS/RAG-Anything.git
+[submodule "LightRAG"]
+	path = LightRAG
+	url = https://github.com/HKUDS/LightRAG.git
