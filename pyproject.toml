@@ -15,10 +15,14 @@ dependencies = [
     'PyYAML>=6.0,<7.0',
     'python-multipart>=0.0.9,<1.0',
     'pypdf>=4.0,<5.0',
+    'redis>=5.0,<8.0',
+    'minio>=7.2,<8.0',
+    'httpx>=0.27,<1.0',
 ]
 
 [project.scripts]
 multimodal-kb = 'app.main:main'
+mineru-parser-service = 'app.mineru_parser_service:main'
 
 [tool.setuptools]
 packages = ['app']

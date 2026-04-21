@@ -1,0 +1,25 @@
+server:
+  host: 0.0.0.0
+  port: 8090
+  log_level: INFO
+
+auth:
+  enabled: true
+  api_key_env: MINERU_PARSER_API_KEY
+
+object_storage:
+  endpoint: minio:9000
+  bucket: multimodal-kb
+  access_key_env: MINIO_ACCESS_KEY_ID
+  secret_key_env: MINIO_SECRET_ACCESS_KEY
+  secure: false
+  region:
+
+mineru:
+  default_backend: pipeline
+  default_device: cuda:0
+  source: local
+  max_concurrency: 1
+  local_work_root: /app/data/parser_jobs
+  cleanup_local_inputs: true
+  cleanup_local_outputs: true

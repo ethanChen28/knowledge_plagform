@@ -2,6 +2,74 @@ services:
   # Qdrant and Neo4j services are already running on the host
   # See: qdrant-docker (6333), neo4j-docker (7474/7687)
 
+  redis:
+    image: redis:7-alpine
+    container_name: multimodal-kb-redis
+    networks:
+      - app-network
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    container_name: multimodal-kb-minio
+    networks:
+      - app-network
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    command: minio server /data --console-address ":9001"
+    volumes:
+      - ./data/minio:/data
+    restart: unless-stopped
+
+  mineru-parser-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.mineru-parser-service
+    container_name: mineru-parser-service
+    networks:
+      - app-network
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      MINIO_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINERU_PARSER_API_KEY: ${MINERU_PARSER_API_KEY:-internal-mineru-token}
+      # NVIDIA GPU support (uncomment if nvidia-container-runtime is available)
+      # NVIDIA_VISIBLE_DEVICES: all
+      # NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    # runtime: nvidia
+    volumes:
+      - ./config/mineru_parser_service.yaml:/app/config/mineru_parser_service.yaml:ro
+      - ./data/parser-service:/app/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://127.0.0.1:8090/health || exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
   multimodal-kb:
     build:
       context: .
@@ -11,6 +79,13 @@ services:
       - app-network
     ports:
       - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      mineru-parser-service:
+        condition: service_healthy
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-EMPTY}
       QDRANT_URL: http://host.docker.internal:6333
@@ -19,6 +94,10 @@ services:
       NEO4J_USERNAME: neo4j
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-12345678}
       NEO4J_DATABASE: neo4j
+      REDIS_URI: redis://redis:6379/0
+      MINIO_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINERU_PARSER_API_KEY: ${MINERU_PARSER_API_KEY:-internal-mineru-token}
       # NVIDIA GPU support (uncomment if nvidia-container-runtime is available)
       # NVIDIA_VISIBLE_DEVICES: all
       # NVIDIA_DRIVER_CAPABILITIES: compute,utility

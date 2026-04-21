@@ -4,6 +4,41 @@ server:
   data_root: /app/data
   log_level: INFO
 
+redis:
+  enabled: true
+  uri: redis://redis:6379/0
+  max_connections: 200
+  socket_timeout_seconds: 30
+  connect_timeout_seconds: 10
+  retry_attempts: 3
+
+object_storage:
+  enabled: true
+  provider: minio
+  endpoint: minio:9000
+  bucket: multimodal-kb
+  prefix: knowledge_bases
+  access_key_env: MINIO_ACCESS_KEY_ID
+  secret_key_env: MINIO_SECRET_ACCESS_KEY
+  secure: false
+  region:
+  upload_inputs: true
+  upload_outputs: true
+  preserve_local_inputs: false
+  preserve_local_outputs: false
+
+parser_service:
+  enabled: true
+  provider: remote_mineru
+  base_url: http://mineru-parser-service:8090
+  api_key_env: MINERU_PARSER_API_KEY
+  connect_timeout_seconds: 10
+  read_timeout_seconds: 1800
+  default_backend: pipeline
+  default_source: local
+  default_device:
+  healthcheck_enabled: true
+
 models:
   llm:
     provider: openai_compatible
@@ -37,7 +72,7 @@ models:
     client_configs: {}
 
 rag_anything:
-  parser: mineru
+  parser: remote_mineru
   parse_method: auto
   parser_output_dir: output
   display_content_stats: true
@@ -57,8 +92,10 @@ rag_anything:
 
 light_rag:
   init_kwargs:
+    kv_storage: RedisKVStorage
     vector_storage: QdrantVectorDBStorage
     graph_storage: Neo4JStorage
+    doc_status_storage: RedisDocStatusStorage
     cosine_better_than_threshold: 0.2
   query_defaults:
     mode: hybrid

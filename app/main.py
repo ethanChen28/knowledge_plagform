@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -41,8 +42,14 @@ for dependency_dir in (ROOT_DIR / 'LightRAG', ROOT_DIR / 'RAG-Anything'):
 from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.utils import EmbeddingFunc
 from raganything import RAGAnything, RAGAnythingConfig
+from app.object_storage import MinIOObjectStore
 from app.preprocess import preprocess_large_document
 from app.progress import ProgressTracker
+from app.remote_mineru_parser import (
+    RemoteMineruParserConfig,
+    consume_remote_mineru_parse_result,
+    configure_remote_mineru_parser,
+)
 
 
 def utc_now_iso() -> str:
@@ -60,6 +67,68 @@ class ServerSettings(BaseModel):
     port: int = 8080
     data_root: Path = Path('./data')
     log_level: str = 'INFO'
+
+
+class RedisSettings(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    enabled: bool = False
+    uri: str = 'redis://redis:6379/0'
+    max_connections: int = 200
+    socket_timeout_seconds: float = 30.0
+    connect_timeout_seconds: float = 10.0
+    retry_attempts: int = 3
+
+
+class ObjectStorageSettings(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    provider: Literal['minio'] = 'minio'
+    enabled: bool = False
+    endpoint: str = 'minio:9000'
+    bucket: str = 'multimodal-kb'
+    prefix: str = 'knowledge_bases'
+    access_key_env: str = 'MINIO_ACCESS_KEY_ID'
+    secret_key_env: str = 'MINIO_SECRET_ACCESS_KEY'
+    secure: bool = False
+    region: str | None = None
+    upload_inputs: bool = True
+    upload_outputs: bool = True
+    preserve_local_inputs: bool = False
+    preserve_local_outputs: bool = False
+
+    def resolve_access_key(self) -> str:
+        access_key = os.getenv(self.access_key_env)
+        if access_key:
+            return access_key
+        raise ValueError(f'Environment variable {self.access_key_env} is required for MinIO access.')
+
+    def resolve_secret_key(self) -> str:
+        secret_key = os.getenv(self.secret_key_env)
+        if secret_key:
+            return secret_key
+        raise ValueError(f'Environment variable {self.secret_key_env} is required for MinIO access.')
+
+
+class ParserServiceSettings(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    enabled: bool = False
+    provider: Literal['remote_mineru'] = 'remote_mineru'
+    base_url: str = 'http://mineru-parser-service:8090'
+    api_key_env: str = 'MINERU_PARSER_API_KEY'
+    connect_timeout_seconds: float = 10.0
+    read_timeout_seconds: float = 1800.0
+    default_backend: str = 'pipeline'
+    default_source: str = 'local'
+    default_device: str | None = None
+    healthcheck_enabled: bool = True
+
+    def resolve_api_key(self) -> str:
+        api_key = os.getenv(self.api_key_env)
+        if api_key:
+            return api_key
+        raise ValueError(f'Environment variable {self.api_key_env} is required for remote parser access.')
 
 
 class OpenAICompatibleModelSettings(BaseModel):
@@ -151,6 +220,9 @@ class AppSettings(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     server: ServerSettings = Field(default_factory=ServerSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
+    object_storage: ObjectStorageSettings = Field(default_factory=ObjectStorageSettings)
+    parser_service: ParserServiceSettings = Field(default_factory=ParserServiceSettings)
     models: ModelSettings
     rag_anything: RAGAnythingSettings = Field(default_factory=RAGAnythingSettings)
     light_rag: LightRAGSettings = Field(default_factory=LightRAGSettings)
@@ -160,6 +232,13 @@ class AppSettings(BaseModel):
         if self.rag_anything.enable_image_processing:
             if self.models.vision is None or not self.models.vision.enabled:
                 raise ValueError('Vision model configuration is required when enable_image_processing is true.')
+        if self.parser_service.enabled:
+            if not self.object_storage.enabled:
+                raise ValueError('object_storage must be enabled when parser_service is enabled.')
+            if not self.object_storage.upload_inputs:
+                raise ValueError('object_storage.upload_inputs must be enabled when parser_service is enabled.')
+            if not self.object_storage.upload_outputs:
+                raise ValueError('object_storage.upload_outputs must be enabled when parser_service is enabled.')
         return self
 
 
@@ -176,6 +255,13 @@ class DocumentRecord(BaseModel):
     updated_at: str = Field(default_factory=utc_now_iso)
     doc_id: str | None = None
     error_message: str | None = None
+    input_object_key: str | None = None
+    output_object_prefix: str | None = None
+    parse_backend: str | None = None
+    parse_job_id: str | None = None
+    parse_started_at: str | None = None
+    parse_finished_at: str | None = None
+    parse_error_message: str | None = None
 
 
 class KnowledgeBaseRecord(BaseModel):
@@ -451,6 +537,8 @@ class EngineRegistry:
 
         light_rag_kwargs = dict(self.settings.light_rag.init_kwargs)
         light_rag_kwargs.update(light_rag_overrides)
+        light_rag_kwargs['workspace'] = knowledge_base.id
+        self._prepare_storage_environment(light_rag_kwargs)
 
         engine = RAGAnything(
             config=rag_config,
@@ -465,6 +553,26 @@ class EngineRegistry:
             raise RuntimeError(status.get('error', 'Failed to initialize RAG engine.'))
 
         return engine
+
+    def _prepare_storage_environment(self, light_rag_kwargs: dict[str, Any]) -> None:
+        storage_names = {
+            str(light_rag_kwargs.get('kv_storage', '')),
+            str(light_rag_kwargs.get('doc_status_storage', '')),
+        }
+        uses_redis = any(name.startswith('Redis') for name in storage_names if name)
+        if not uses_redis:
+            return
+
+        if self.settings.redis.enabled:
+            os.environ['REDIS_URI'] = self.settings.redis.uri
+            os.environ['REDIS_MAX_CONNECTIONS'] = str(self.settings.redis.max_connections)
+            os.environ['REDIS_SOCKET_TIMEOUT'] = str(self.settings.redis.socket_timeout_seconds)
+            os.environ['REDIS_CONNECT_TIMEOUT'] = str(self.settings.redis.connect_timeout_seconds)
+            os.environ['REDIS_RETRY_ATTEMPTS'] = str(self.settings.redis.retry_attempts)
+            return
+
+        if not os.getenv('REDIS_URI'):
+            raise ValueError('REDIS_URI must be configured when using Redis storage backends.')
 
     def _build_llm_model_func(self, settings: OpenAICompatibleModelSettings):
         api_key = settings.resolve_api_key()
@@ -552,6 +660,38 @@ class KnowledgeBaseService:
         self.store = MetadataStore(settings.server.data_root)
         self.engines = EngineRegistry(settings)
         self._background_tasks: set[asyncio.Task] = set()
+        self.object_store = self._build_object_store()
+
+    def _build_object_store(self) -> MinIOObjectStore | None:
+        if not self.settings.object_storage.enabled:
+            return None
+        return MinIOObjectStore(
+            endpoint=self.settings.object_storage.endpoint,
+            access_key=self.settings.object_storage.resolve_access_key(),
+            secret_key=self.settings.object_storage.resolve_secret_key(),
+            bucket_name=self.settings.object_storage.bucket,
+            secure=self.settings.object_storage.secure,
+            region=self.settings.object_storage.region,
+        )
+
+    async def initialize(self) -> None:
+        if self.object_store is not None:
+            await self.object_store.ensure_bucket()
+        if self.settings.parser_service.enabled:
+            if self.object_store is None:
+                raise ValueError('Object storage is required when parser_service is enabled.')
+            configure_remote_mineru_parser(
+                RemoteMineruParserConfig(
+                    base_url=self.settings.parser_service.base_url,
+                    api_key=self.settings.parser_service.resolve_api_key(),
+                    connect_timeout_seconds=self.settings.parser_service.connect_timeout_seconds,
+                    read_timeout_seconds=self.settings.parser_service.read_timeout_seconds,
+                    default_backend=self.settings.parser_service.default_backend,
+                    default_source=self.settings.parser_service.default_source,
+                    default_device=self.settings.parser_service.default_device,
+                ),
+                self.object_store,
+            )
 
     def get_paths(self, knowledge_base_id: str) -> KnowledgeBasePaths:
         root = self.settings.server.data_root / 'knowledge_bases' / knowledge_base_id
@@ -581,6 +721,142 @@ class KnowledgeBaseService:
     def resolve_rag_override(self, knowledge_base: KnowledgeBaseRecord, key: str, default: Any) -> Any:
         return knowledge_base.config_overrides.get('rag_anything', {}).get(key, default)
 
+    def resolve_rag_parser(self, knowledge_base: KnowledgeBaseRecord) -> str:
+        return str(self.resolve_rag_override(knowledge_base, 'parser', self.settings.rag_anything.parser))
+
+    def _build_object_key(self, *parts: str) -> str:
+        return MinIOObjectStore.normalize_key(*parts)
+
+    def build_knowledge_base_object_prefix(self, knowledge_base_id: str) -> str:
+        return self._build_object_key(self.settings.object_storage.prefix, knowledge_base_id)
+
+    def build_input_object_key(self, knowledge_base_id: str, stored_filename: str) -> str:
+        return self._build_object_key(self.build_knowledge_base_object_prefix(knowledge_base_id), 'inputs', stored_filename)
+
+    def get_parse_output_dir(self, input_path: Path, output_root: Path) -> Path:
+        path_hash = hashlib.md5(str(input_path.resolve()).encode('utf-8')).hexdigest()[:8]
+        return output_root / f'{input_path.stem}_{path_hash}'
+
+    def build_output_object_prefix(self, knowledge_base_id: str, input_path: Path, output_root: Path) -> str:
+        return self._build_object_key(
+            self.build_knowledge_base_object_prefix(knowledge_base_id),
+            'output',
+            self.get_parse_output_dir(input_path, output_root).name,
+        )
+
+    async def _upload_document_input(
+        self,
+        knowledge_base_id: str,
+        paths: KnowledgeBasePaths,
+        document: DocumentRecord,
+    ) -> DocumentRecord:
+        if self.object_store is None or not self.settings.object_storage.upload_inputs:
+            return document
+        object_key = document.input_object_key or self.build_input_object_key(knowledge_base_id, document.stored_filename)
+        await self.object_store.upload_file(
+            object_key,
+            paths.input_dir / document.stored_filename,
+            document.content_type,
+        )
+        updates: dict[str, Any] = {'input_object_key': object_key}
+        if self.settings.object_storage.upload_outputs:
+            updates['output_object_prefix'] = (
+                document.output_object_prefix
+                or self.build_output_object_prefix(
+                    knowledge_base_id,
+                    paths.input_dir / document.stored_filename,
+                    paths.output_dir,
+                )
+            )
+        return document.model_copy(update=updates)
+
+    async def _ensure_document_input_local(
+        self,
+        knowledge_base_id: str,
+        paths: KnowledgeBasePaths,
+        document: DocumentRecord,
+    ) -> Path:
+        input_path = paths.input_dir / document.stored_filename
+        if input_path.exists():
+            return input_path
+
+        if self.object_store is None:
+            raise FileNotFoundError(f'Input file not found: {input_path}')
+
+        object_key = document.input_object_key or self.build_input_object_key(knowledge_base_id, document.stored_filename)
+        downloaded = await self.object_store.download_file(object_key, input_path)
+        if not downloaded:
+            raise FileNotFoundError(f'Input file missing locally and in object storage: {object_key}')
+        return input_path
+
+    async def _ensure_document_output_local(
+        self,
+        knowledge_base_id: str,
+        paths: KnowledgeBasePaths,
+        document: DocumentRecord,
+        input_path: Path,
+    ) -> Path:
+        output_dir = self.get_parse_output_dir(input_path, paths.output_dir)
+        if output_dir.exists() or self.object_store is None or not self.settings.object_storage.upload_outputs:
+            return output_dir
+
+        object_prefix = document.output_object_prefix or self.build_output_object_prefix(knowledge_base_id, input_path, paths.output_dir)
+        await self.object_store.download_prefix(object_prefix, output_dir)
+        return output_dir
+
+    async def _archive_document_output(
+        self,
+        knowledge_base_id: str,
+        paths: KnowledgeBasePaths,
+        document: DocumentRecord,
+        input_path: Path,
+    ) -> str | None:
+        if self.object_store is None or not self.settings.object_storage.upload_outputs:
+            return document.output_object_prefix
+
+        output_dir = self.get_parse_output_dir(input_path, paths.output_dir)
+        if not output_dir.exists():
+            return document.output_object_prefix
+
+        object_prefix = document.output_object_prefix or self.build_output_object_prefix(knowledge_base_id, input_path, paths.output_dir)
+        await self.object_store.upload_directory(object_prefix, output_dir)
+        return object_prefix
+
+    def _cleanup_local_document_artifacts(
+        self,
+        paths: KnowledgeBasePaths,
+        document: DocumentRecord,
+        input_path: Path | None,
+    ) -> None:
+        if self.object_store is None:
+            return
+
+        if input_path is not None and document.input_object_key and not self.settings.object_storage.preserve_local_inputs:
+            input_path.unlink(missing_ok=True)
+
+        if document.output_object_prefix and not self.settings.object_storage.preserve_local_outputs:
+            output_dir = self.get_parse_output_dir(paths.input_dir / document.stored_filename, paths.output_dir)
+            if output_dir.exists():
+                shutil.rmtree(output_dir, ignore_errors=True)
+
+    async def _ensure_query_outputs_local(
+        self,
+        knowledge_base: KnowledgeBaseRecord,
+        paths: KnowledgeBasePaths,
+    ) -> None:
+        if self.object_store is None or not self.settings.object_storage.upload_outputs:
+            return
+
+        for document in knowledge_base.documents:
+            if document.status != 'completed' or not document.output_object_prefix:
+                continue
+            await self._ensure_document_output_local(
+                knowledge_base.id,
+                paths,
+                document,
+                paths.input_dir / document.stored_filename,
+            )
+
     async def require_knowledge_base(self, knowledge_base_id: str) -> KnowledgeBaseRecord:
         knowledge_base = await self.store.get_knowledge_base(knowledge_base_id)
         if knowledge_base is None:
@@ -601,11 +877,14 @@ class KnowledgeBaseService:
         return await self.store.save_knowledge_base(knowledge_base)
 
     async def delete_knowledge_base(self, knowledge_base_id: str, purge_data: bool) -> DeleteKnowledgeBaseResponse:
+        await self.require_knowledge_base(knowledge_base_id)
         paths = self.get_paths(knowledge_base_id)
+        await self.engines.close_engine(knowledge_base_id)
+        if purge_data and self.object_store is not None:
+            await self.object_store.delete_prefix(self.build_knowledge_base_object_prefix(knowledge_base_id))
         deleted = await self.store.delete_knowledge_base(knowledge_base_id)
         if deleted is None:
             raise KnowledgeBaseNotFoundError(knowledge_base_id)
-        await self.engines.close_engine(knowledge_base_id)
         if purge_data and paths.root.exists():
             shutil.rmtree(paths.root)
         return DeleteKnowledgeBaseResponse(knowledge_base_id=knowledge_base_id, deleted=True, data_purged=purge_data)
@@ -682,6 +961,12 @@ class KnowledgeBaseService:
                     size_bytes=size_bytes
                 ))
 
+        if self.object_store is not None and self.settings.object_storage.upload_inputs:
+            documents = [
+                await self._upload_document_input(knowledge_base_id, paths, document)
+                for document in documents
+            ]
+
         await self.store.append_documents(knowledge_base_id, documents)
         task = asyncio.create_task(self._ingest_documents(knowledge_base_id, [document.id for document in documents]))
         self._track_background_task(task)
@@ -708,21 +993,134 @@ class KnowledgeBaseService:
                 if document is None:
                     continue
 
-                await self.store.update_document(knowledge_base_id, document_id, status='processing', error_message=None)
+                parser_name = self.resolve_rag_parser(refreshed_knowledge_base)
+                document = await self.store.update_document(
+                    knowledge_base_id,
+                    document_id,
+                    status='processing',
+                    error_message=None,
+                    parse_backend=parser_name,
+                    parse_started_at=utc_now_iso(),
+                    parse_finished_at=None,
+                    parse_error_message=None,
+                )
+                input_path: Path | None = None
+                parse_result = None
                 try:
+                    if parser_name == 'remote_mineru' and self.object_store is not None and not document.input_object_key:
+                        document = await self._upload_document_input(knowledge_base_id, paths, document)
+                        document = await self.store.update_document(
+                            knowledge_base_id,
+                            document_id,
+                            input_object_key=document.input_object_key,
+                            output_object_prefix=document.output_object_prefix,
+                        )
+
+                    input_path = await self._ensure_document_input_local(knowledge_base_id, paths, document)
+                    await self._ensure_document_output_local(knowledge_base_id, paths, document, input_path)
+
+                    parser_kwargs: dict[str, Any] = {}
+                    backend_value = 'pipeline'
+                    if parser_name == 'remote_mineru':
+                        output_object_prefix = document.output_object_prefix or self.build_output_object_prefix(
+                            knowledge_base_id,
+                            input_path,
+                            paths.output_dir,
+                        )
+                        if output_object_prefix != document.output_object_prefix:
+                            document = await self.store.update_document(
+                                knowledge_base_id,
+                                document_id,
+                                output_object_prefix=output_object_prefix,
+                            )
+                        backend_value = self.settings.parser_service.default_backend
+                        parser_kwargs.update({
+                            'request_id': document.id,
+                            'document_id': document.id,
+                            'knowledge_base_id': knowledge_base_id,
+                            'input_object_key': document.input_object_key,
+                            'output_object_prefix': document.output_object_prefix,
+                            'source': self.settings.parser_service.default_source,
+                            'device': self.settings.parser_service.default_device,
+                            'parser_file_name': document.original_filename,
+                        })
+
                     await engine.process_document_complete(
-                        file_path=str(paths.input_dir / document.stored_filename),
+                        file_path=str(input_path),
                         output_dir=str(paths.output_dir),
                         parse_method=self.resolve_rag_override(refreshed_knowledge_base, 'parse_method', self.settings.rag_anything.parse_method),
                         display_stats=self.resolve_rag_override(refreshed_knowledge_base, 'display_content_stats', self.settings.rag_anything.display_content_stats),
                         doc_id=document.id,
                         file_name=document.original_filename,
-                        backend='pipeline',
+                        backend=backend_value,
+                        **parser_kwargs,
                     )
-                    await self.store.update_document(knowledge_base_id, document_id, status='completed', doc_id=document.id, error_message=None)
+                    if parser_name == 'remote_mineru':
+                        parse_result = consume_remote_mineru_parse_result(document.id)
+
+                    output_object_prefix = document.output_object_prefix
+                    if parse_result is not None and parse_result.output_object_prefix:
+                        output_object_prefix = parse_result.output_object_prefix
+                    elif input_path is not None:
+                        try:
+                            output_object_prefix = await self._archive_document_output(knowledge_base_id, paths, document, input_path)
+                        except Exception:
+                            logging.exception('Failed to archive document output for %s', document_id)
+
+                    document = document.model_copy(
+                        update={
+                            'output_object_prefix': output_object_prefix,
+                            'parse_job_id': parse_result.job_id if parse_result is not None else document.parse_job_id,
+                            'parse_error_message': parse_result.error_message if parse_result is not None else None,
+                        }
+                    )
+                    await self.store.update_document(
+                        knowledge_base_id,
+                        document_id,
+                        status='completed',
+                        doc_id=document.id,
+                        error_message=None,
+                        output_object_prefix=output_object_prefix,
+                        parse_backend=parser_name,
+                        parse_job_id=document.parse_job_id,
+                        parse_finished_at=utc_now_iso(),
+                        parse_error_message=document.parse_error_message,
+                    )
                 except Exception as exc:
                     logging.exception('Document ingestion failed for %s', document_id)
-                    await self.store.update_document(knowledge_base_id, document_id, status='failed', error_message=str(exc))
+                    if parser_name == 'remote_mineru':
+                        parse_result = consume_remote_mineru_parse_result(document.id)
+                    output_object_prefix = document.output_object_prefix
+                    if parse_result is not None and parse_result.output_object_prefix:
+                        output_object_prefix = parse_result.output_object_prefix
+                    elif input_path is not None:
+                        try:
+                            output_object_prefix = await self._archive_document_output(knowledge_base_id, paths, document, input_path)
+                        except Exception:
+                            logging.exception('Failed to archive partial document output for %s', document_id)
+                    parse_error_message = str(exc)
+                    if parse_result is not None and parse_result.error_message:
+                        parse_error_message = parse_result.error_message
+                    document = document.model_copy(
+                        update={
+                            'output_object_prefix': output_object_prefix,
+                            'parse_job_id': parse_result.job_id if parse_result is not None else document.parse_job_id,
+                            'parse_error_message': parse_error_message,
+                        }
+                    )
+                    await self.store.update_document(
+                        knowledge_base_id,
+                        document_id,
+                        status='failed',
+                        error_message=str(exc),
+                        output_object_prefix=output_object_prefix,
+                        parse_backend=parser_name,
+                        parse_job_id=document.parse_job_id,
+                        parse_finished_at=utc_now_iso(),
+                        parse_error_message=document.parse_error_message,
+                    )
+                finally:
+                    self._cleanup_local_document_artifacts(paths, document, input_path)
 
     def materialize_query_content(self, knowledge_base_id: str, items: list[QueryMultimodalItem]) -> tuple[list[dict[str, Any]], list[Path]]:
         if not items:
@@ -770,6 +1168,7 @@ class KnowledgeBaseService:
 
         try:
             async with lock:
+                await self._ensure_query_outputs_local(knowledge_base, paths)
                 engine = await self.engines.get_engine(knowledge_base, paths)
                 if payloads:
                     answer = await engine.aquery_with_multimodal(request.query, multimodal_content=payloads, mode=mode, system_prompt=request.system_prompt, **query_kwargs)
@@ -806,6 +1205,7 @@ def create_app(settings: AppSettings) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         service = KnowledgeBaseService(settings)
+        await service.initialize()
         app.state.service = service
         yield
         await service.shutdown()
