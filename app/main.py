@@ -13,6 +13,14 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+# Patch MinerU VLM client to skip model name validation against /v1/models,
+# since some OpenAI-compatible servers use model aliases not listed in the models endpoint.
+try:
+    from mineru_vl_utils.vlm_client import http_client as _hc
+    _hc.HttpVlmClient._check_model_name = lambda self, base_url, model_name: None
+except Exception:
+    pass
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -62,15 +70,19 @@ class OpenAICompatibleModelSettings(BaseModel):
     model: str
     base_url: str
     api_key_env: str
+    api_key_optional: bool = False
+    placeholder_api_key: str = "EMPTY"
     timeout_seconds: int = 180
     client_configs: dict[str, Any] = Field(default_factory=dict)
     extra_body: dict[str, Any] = Field(default_factory=dict)
 
     def resolve_api_key(self) -> str:
         api_key = os.getenv(self.api_key_env)
-        if not api_key:
-            raise ValueError(f'Environment variable {self.api_key_env} is required for model {self.model}.')
-        return api_key
+        if api_key:
+            return api_key
+        if self.api_key_optional:
+            return self.placeholder_api_key
+        raise ValueError(f'Environment variable {self.api_key_env} is required for model {self.model}.')
 
 
 class EmbeddingSettings(BaseModel):
@@ -705,6 +717,7 @@ class KnowledgeBaseService:
                         display_stats=self.resolve_rag_override(refreshed_knowledge_base, 'display_content_stats', self.settings.rag_anything.display_content_stats),
                         doc_id=document.id,
                         file_name=document.original_filename,
+                        backend='pipeline',
                     )
                     await self.store.update_document(knowledge_base_id, document_id, status='completed', doc_id=document.id, error_message=None)
                 except Exception as exc:

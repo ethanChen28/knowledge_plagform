@@ -1,0 +1,77 @@
+services:
+  # Qdrant vector database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Neo4j graph database
+  neo4j:
+    image: neo4j:latest
+    container_name: neo4j
+    ports:
+      - "7474:7474"  # Browser
+      - "7687:7687"  # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/12345678
+      NEO4J_PLUGINS: "[\"apoc\"]"
+    volumes:
+      - neo4j-storage:/data
+      - neo4j-log:/logs
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Multimodal knowledge base service
+  multimodal-kb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: multimodal-kb
+    networks:
+      - app-network
+    ports:
+      - "8080:8080"
+    environment:
+      OPENAI_API_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3NzcyNjgxMzQsImlhdCI6MTc3NjY2MzMzNCwidWlkIjoyfQ._bl9lwANdKvpMzU3rPe1Bx9eeMCvKwLYp_uIPZ_REPQ
+      ZHIPU_API_KEY: 65ba75d8c8404385b40145633ab16ce2.dzIPDI2HzT1fWaYI
+      QDRANT_URL: http://qdrant:6333
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-EMPTY}
+      NEO4J_URI: neo4j://neo4j:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-12345678}
+      NEO4J_DATABASE: neo4j
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    runtime: nvidia
+    volumes:
+      - ./config/config.yaml:/app/config/config.yaml:ro
+      - ./data:/app/data
+    depends_on:
+      - qdrant
+      - neo4j
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://127.0.0.1:8080/health || exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  qdrant-storage:
+  neo4j-storage:
+  neo4j-log:
+
+networks:
+  app-network:
+    driver: bridge

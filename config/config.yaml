@@ -8,8 +8,8 @@ models:
   llm:
     provider: openai_compatible
     enabled: true
-    model: Qwen3.5-397B
-    base_url: http://192.168.11.18:30055/v1
+    model: /nfs/aihub_modelcenter/models/39/59a4698c-9c4f-11f0-9f11-4a7e4d9e050f
+    base_url: http://192.168.11.18:30211/v1
     api_key_env: OPENAI_API_KEY
     timeout_seconds: 180
     client_configs: {}
@@ -17,14 +17,12 @@ models:
   vision:
     provider: openai_compatible
     enabled: true
-    model: Qwen3.5-397B
-    base_url: http://192.168.11.18:30055/v1
+    model: Qwen3-VL-8B-Instruct
+    base_url: http://192.168.11.18:30218/v1
     api_key_env: OPENAI_API_KEY
     timeout_seconds: 180
     client_configs: {}
     extra_body: {}
-    # Qwen is used for chat and multimodal requests.
-    # Embeddings are served by the dedicated BAAI/bge-m3 endpoint below.
   embedding:
     provider: openai_compatible
     enabled: true
